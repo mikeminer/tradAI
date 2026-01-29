@@ -1,3 +1,4 @@
+<img width="955" height="666" alt="image" src="https://github.com/user-attachments/assets/bf53b921-bf84-4069-8e36-aa0065bf70b4" />
 
 # 🚀 tradai.py
 
