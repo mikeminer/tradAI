@@ -24,11 +24,14 @@ import pyqtgraph.opengl as gl
 
 
 # =========================
-# HARD RULES
+# HARD RULES / LIMITI
 # =========================
-MIN_WINRATE = 0.90         # required on TEST and Walk-forward OOS
-MIN_TRADES_TEST = 80       # anti-cheat: must have enough executed trades on TEST
-MIN_TRADES_WALK = 120      # anti-cheat: enough trades across walk-forward OOS
+MIN_WINRATE = 0.90         # usato per "early stop" se viene raggiunto
+MIN_TRADES_TEST = 80       # anti-cheat (early stop): trade minimi su TEST
+MIN_TRADES_WALK = 120      # anti-cheat (early stop): trade minimi su WALK
+
+# ✅ OPZIONE 2: tuning massimo 30 minuti, poi usa BEST trovato
+MAX_TUNING_MINUTES = 30
 
 
 # =========================
@@ -42,7 +45,6 @@ PROFILES = {
         "days_primary": 75,
         "days_secondary": 160,
 
-        # base values (tuning will vary these)
         "horizon_bars": 6,
         "thr": 0.0012,
         "epochs": 14,
@@ -56,11 +58,10 @@ PROFILES = {
 
         "tp_base_mult": 0.85,
 
-        # tuning grids (continue until >= 90% winrate on executed trades)
         "thr_grid":     [0.0010, 0.0012, 0.0015, 0.0018, 0.0022, 0.0028, 0.0035],
         "horizon_grid": [4, 6, 8, 10, 12],
         "epoch_grid":   [14, 18, 24],
-        "conf_grid":    [0.40, 0.45, 0.50, 0.55, 0.60, 0.65],  # trade only if prob>=conf
+        "conf_grid":    [0.40, 0.45, 0.50, 0.55, 0.60, 0.65],
     },
     "SWING (15m/1h)": {
         "primary_tf": "15m",
@@ -330,14 +331,13 @@ def build_labels_3(close: np.ndarray, horizon: int, thr: float) -> np.ndarray:
             y[i] = 1
         else:
             y[i] = 2
-    # last horizon bars: keep NO_TRADE (no future)
     return y
 
 def make_dataset_multitf_3(df_p: pd.DataFrame, df_s: pd.DataFrame,
                            horizon: int, thr: float, tf_s_ms: int) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     feat = merge_primary_secondary(df_p, df_s, tf_s_ms=tf_s_ms)
 
-    # placeholders for live-only features (deterministic zeros during training)
+    # placeholder per features live-only (storico deterministico = 0)
     for col in ["ob_spread", "ob_top_imb", "ob_depth_imb", "ob_bid_depth", "ob_ask_depth", "funding_rate", "open_interest"]:
         feat[col] = 0.0
 
@@ -453,11 +453,7 @@ def probs(model: nn.Module, X: np.ndarray, device: torch.device) -> np.ndarray:
 
 
 # =========================
-# BACKTEST with NO TRADE + confidence threshold
-# class mapping: 0 LONG, 1 SHORT, 2 NO_TRADE
-# Decision:
-#  - if argmax == 2 -> NO TRADE
-#  - else if max(long,short) < conf_thr -> NO TRADE
+# BACKTEST: 3-class + confidence gating
 # =========================
 def backtest_3class(close: np.ndarray, probs3: np.ndarray, horizon: int, conf_thr: float, fee_bps: float = 2.0) -> dict:
     n = min(len(probs3), len(close) - horizon)
@@ -472,9 +468,12 @@ def backtest_3class(close: np.ndarray, probs3: np.ndarray, horizon: int, conf_th
         p_long, p_short, p_nt = probs3[i]
 
         cls = int(np.argmax([p_long, p_short, p_nt]))
-        # apply confidence gating for LONG/SHORT
+
+        # NO TRADE se classe=2
         if cls == 2:
             continue
+
+        # NO TRADE se confidenza non supera soglia
         if max(p_long, p_short) < conf_thr:
             continue
 
@@ -496,8 +495,8 @@ def backtest_3class(close: np.ndarray, probs3: np.ndarray, horizon: int, conf_th
     total = float(np.prod(1.0 + rets) - 1.0)
     return {"trades": trades, "winrate": winrate, "avg_ret": avg_ret, "total": total}
 
-
-def walk_forward_oos_3class(Xs: np.ndarray, y: np.ndarray, close: np.ndarray, cfg: dict, device: torch.device, conf_thr: float, horizon: int, epochs: int) -> dict:
+def walk_forward_oos_3class(Xs: np.ndarray, y: np.ndarray, close: np.ndarray, cfg: dict,
+                           device: torch.device, conf_thr: float, horizon: int, epochs: int) -> dict:
     train_w = int(cfg["walk_train_bars"])
     test_w = int(cfg["walk_test_bars"])
 
@@ -615,7 +614,6 @@ class Net3D(gl.GLViewWidget):
         self.pos_h2 = self._layer_positions(h2, x=1.0)
         self.pos_h3 = self._layer_positions(h3, x=3.3)
 
-        # 3 outputs
         self.pos_out = np.array([[5.5,  1.2, 0.0],   # LONG
                                  [5.5,  0.0, 0.0],   # SHORT
                                  [5.5, -1.2, 0.0]],  # NO TRADE
@@ -763,7 +761,7 @@ class Worker(QtCore.QObject):
         return row.values.astype(np.float32)
 
     # -------------------------
-    # AUTO-TUNING UNTIL >= 90%
+    # AUTO-TUNING
     # -------------------------
     def evaluate_config(self, df_p, df_s, thr, horizon, epochs, conf_thr):
         X, y, used_df = make_dataset_multitf_3(
@@ -818,7 +816,7 @@ class Worker(QtCore.QObject):
             "in_dim": int(X.shape[1]),
         }
 
-    def auto_search_until_90(self, df_p, df_s):
+    def auto_search_with_timeout(self, df_p, df_s):
         thr_grid = self.cfg.get("thr_grid", [self.cfg["thr"]])
         horizon_grid = self.cfg.get("horizon_grid", [self.cfg["horizon_bars"]])
         epoch_grid = self.cfg.get("epoch_grid", [self.cfg["epochs"]])
@@ -827,13 +825,22 @@ class Worker(QtCore.QObject):
         best = None
         best_score = -1.0
 
-        # Order chosen to increase NO-TRADE behavior gradually (higher conf & higher thr)
+        start_time = time.time()
+        max_seconds = MAX_TUNING_MINUTES * 60
+
+        # ordine: spinge verso più NO TRADE (conf/thr alti) prima
         for conf_thr in conf_grid[::-1]:
             for thr in thr_grid[::-1]:
                 for horizon in horizon_grid:
                     for ep in epoch_grid:
                         if self._stop:
                             return None
+
+                        # ✅ TIMEOUT
+                        elapsed = time.time() - start_time
+                        if elapsed >= max_seconds:
+                            self.status.emit(f"⏱️ Timeout tuning: {MAX_TUNING_MINUTES} minuti → uso BEST trovato.")
+                            return best
 
                         self.status.emit(f"Tuning: conf={conf_thr:.2f} thr={thr} horizon={horizon} ep={ep}")
                         res = self.evaluate_config(df_p, df_s, thr=thr, horizon=horizon, epochs=ep, conf_thr=conf_thr)
@@ -856,7 +863,7 @@ class Worker(QtCore.QObject):
                             best_score = score
                             best = res
 
-                        # PASS condition: >=90% with enough trades
+                        # early stop se raggiunge vincolo alto + trade sufficienti
                         if (test_wr >= MIN_WINRATE and walk_wr >= MIN_WINRATE and
                             test_tr >= MIN_TRADES_TEST and walk_tr >= MIN_TRADES_WALK):
                             self.status.emit("✅ Raggiunto vincolo 90% (TEST + WALK) con trade sufficienti.")
@@ -865,41 +872,41 @@ class Worker(QtCore.QObject):
         return best
 
     def _train_and_save(self):
-        self.status.emit(f"Scarico storico KuCoin (molti dati)… [{self.primary_tf}/{self.secondary_tf}]")
+        self.status.emit(f"Scarico storico KuCoin… [{self.primary_tf}/{self.secondary_tf}]")
         df_p = fetch_ohlcv_full(self.ex_spot, self.symbol, self.primary_tf, days=int(self.cfg["days_primary"]))
         df_s = fetch_ohlcv_full(self.ex_spot, self.symbol, self.secondary_tf, days=int(self.cfg["days_secondary"]))
 
         if len(df_p) < 2500 or len(df_s) < 1200:
             raise RuntimeError(f"Storico insufficiente: primary={len(df_p)} secondary={len(df_s)}")
 
-        self.status.emit("Auto-tuning: continuo finché supero 90% (TEST + WALK) oppure fino al best possibile…")
-        best = self.auto_search_until_90(df_p, df_s)
+        self.status.emit(f"Auto-tuning (max {MAX_TUNING_MINUTES} minuti)…")
+        best = self.auto_search_with_timeout(df_p, df_s)
         if best is None:
-            raise RuntimeError("Interrotto (ARRESTA) durante auto-tuning.")
+            raise RuntimeError("Interrotto (ARRESTA) durante tuning oppure nessun best trovato.")
 
         bt_test = best["bt_test"]
         wf = best["wf"]
+
+        note = ""
+        if bt_test["trades"] == 0 or wf["trades"] == 0:
+            note = " | ATTENZIONE: 0 trade (conf/thr troppo alti)"
+        if bt_test["winrate"] < MIN_WINRATE or wf["winrate"] < MIN_WINRATE:
+            note += " | NOTE: <90% (ma best usato per live su tua richiesta)"
 
         report = (
             f"PROFILE={self.profile_name} | DEV={device_label(self.device)} | TF={self.primary_tf}/{self.secondary_tf} | "
             f"conf={best['conf_thr']:.2f} thr={best['thr']} horizon={best['horizon']} epochs={best['epochs']} | "
             f"TEST winrate={bt_test['winrate']*100:.1f}% trades={bt_test['trades']} total={bt_test['total']*100:.1f}% | "
-            f"WALK winrate={wf['winrate']*100:.1f}% trades={wf['trades']} seg={wf['segments']} total={wf['total']*100:.1f}% | "
-            f"NOTE: orderbook/funding storici=0 (live-only)"
+            f"WALK winrate={wf['winrate']*100:.1f}% trades={wf['trades']} seg={wf['segments']} total={wf['total']*100:.1f}%"
+            f"{note}"
         )
         self.report.emit(report)
 
-        # Must meet your rule to go LIVE
-        if not (bt_test["winrate"] >= MIN_WINRATE and wf["winrate"] >= MIN_WINRATE and
-                bt_test["trades"] >= MIN_TRADES_TEST and wf["trades"] >= MIN_TRADES_WALK):
-            raise RuntimeError(
-                f"Non raggiunto vincolo LIVE 90% con trade sufficienti. "
-                f"Best trovato: TEST={bt_test['winrate']*100:.1f}% ({bt_test['trades']} trades) | "
-                f"WALK={wf['winrate']*100:.1f}% ({wf['trades']} trades). "
-                f"Per alzare ancora: aumenta conf_grid max o thr_grid max (più NO TRADE)."
-            )
+        self.status.emit(
+            f"BEST usato: TEST={bt_test['winrate']*100:.1f}% ({bt_test['trades']} trades) | "
+            f"WALK={wf['winrate']*100:.1f}% ({wf['trades']} trades). Salvataggio…"
+        )
 
-        self.status.emit("Salvo modello/scaler/meta…")
         torch.save({k: v.detach().cpu() for k, v in best["model"].state_dict().items()}, self.model_file)
         joblib.dump(best["scaler"], self.scaler_file)
         joblib.dump({
@@ -921,9 +928,9 @@ class Worker(QtCore.QObject):
     def _ensure_model(self):
         if self._load_if_exists():
             return
-        self.status.emit("Modello non trovato → AUTO-TRAIN + AUTO-TUNING…")
+        self.status.emit("Modello non trovato → AUTO-TRAIN + TUNING (con timeout)…")
         self._train_and_save()
-        self.status.emit("Training OK (>=90%) → pronto per realtime.")
+        self.status.emit("Modello pronto → avvio realtime.")
 
     @QtCore.Slot()
     def run(self):
@@ -957,7 +964,6 @@ class Worker(QtCore.QObject):
 
                 p_long, p_short, p_nt = float(pr[0]), float(pr[1]), float(pr[2])
 
-                # decision with 3-class + confidence gating
                 cls = int(np.argmax([p_long, p_short, p_nt]))
                 if cls == 2:
                     signal = "NO TRADE"
@@ -993,19 +999,18 @@ class Worker(QtCore.QObject):
 
 
 # =========================
-# GUI (profile + start + stop + device popup)
+# GUI
 # =========================
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ETH KuCoin AI (LONG/SHORT/NO TRADE + auto-tuning >=90% + TP + GPU/CPU + STOP)")
+        self.setWindowTitle("tradai.py — ETH KuCoin AI (LONG/SHORT/NO TRADE + TP + GPU/CPU + STOP + tuning timeout)")
         self.resize(1480, 860)
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         layout = QtWidgets.QGridLayout(central)
 
-        # Controls
         self.profile = QtWidgets.QComboBox()
         self.profile.addItems(list(PROFILES.keys()))
         self.btn_start = QtWidgets.QPushButton("AVVIA")
@@ -1019,7 +1024,6 @@ class MainWindow(QtWidgets.QMainWindow):
         topbar.addWidget(self.btn_start)
         topbar.addWidget(self.btn_stop)
 
-        # Plots
         self.price_plot = pg.PlotWidget(title="ETH Price (live)")
         self.prob_plot = pg.PlotWidget(title="Probabilities (LONG/SHORT/NO TRADE)")
         self.price_curve = self.price_plot.plot()
@@ -1028,7 +1032,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.nt_curve = self.prob_plot.plot(name="NO TRADE")
         self.prob_plot.setYRange(0, 1)
 
-        # Labels
         self.lbl_sig = QtWidgets.QLabel("Signal: -")
         self.lbl_sig.setStyleSheet("font-size: 24px; font-weight: 800;")
         self.lbl_price = QtWidgets.QLabel("Price: -")
@@ -1051,7 +1054,6 @@ class MainWindow(QtWidgets.QMainWindow):
         info.addWidget(self.lbl_report)
         info.addWidget(self.lbl_status)
 
-        # 3D net
         self.model = BiggerMLP(in_dim=32, out_dim=3)
         self.net3d = Net3D(self.model, max_nodes_per_layer=48)
 
@@ -1061,14 +1063,12 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(info, 1, 2, 2, 1)
         layout.addWidget(self.net3d, 1, 3, 2, 1)
 
-        # buffers
         self.max_points = 300
         self.prices: Deque[float] = deque(maxlen=self.max_points)
         self.longps: Deque[float] = deque(maxlen=self.max_points)
         self.shortps: Deque[float] = deque(maxlen=self.max_points)
         self.ntps: Deque[float] = deque(maxlen=self.max_points)
 
-        # worker thread
         self.thread: Optional[QtCore.QThread] = None
         self.worker: Optional[Worker] = None
         self.current_device: Optional[torch.device] = None
@@ -1105,7 +1105,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_start.setEnabled(False)
         self.profile.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self.lbl_status.setText("Status: avvio… (auto-tuning fino a >=90%)")
+        self.lbl_status.setText(f"Status: avvio… (tuning max {MAX_TUNING_MINUTES} min)")
 
         self.thread = QtCore.QThread()
         self.worker = Worker(profile_name=prof, device=dev)
