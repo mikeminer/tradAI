@@ -8,7 +8,7 @@ Premi AVVIA → popup CPU/GPU (GPU compare solo se torch.cuda.is_available() è 
 
 Poi fa 2 fasi:
 
-1) Setup (modello)
+# 1) Setup (modello)
 
 Se trova già i file model_*.pt, scaler_*.joblib, meta_*.joblib → li carica e parte.
 
@@ -17,7 +17,7 @@ Se non li trova → scarica lo storico KuCoin, crea il dataset e fa train/val/te
 In questa fase fa tuning automatico (thr, horizon, epochs, confidenza).
 Massimo 30 minuti: se non raggiunge il 90% si ferma comunque e usa il best trovato.
 
-2) Realtime
+# 2) Realtime
 
 Ogni pochi secondi:
 
