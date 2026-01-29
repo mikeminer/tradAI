@@ -1,5 +1,7 @@
 <img width="955" height="666" alt="image" src="https://github.com/user-attachments/assets/bf53b921-bf84-4069-8e36-aa0065bf70b4" />
 
+
+
 Scegli profilo: Scalping (1m/3m) o Swing (15m/1h).
 
 Premi AVVIA → popup CPU/GPU (GPU compare solo se torch.cuda.is_available() è True).
