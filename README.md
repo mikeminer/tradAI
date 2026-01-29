@@ -6,7 +6,7 @@ Scegli profilo: Scalping (1m/3m) o Swing (15m/1h).
 
 Premi AVVIA → popup CPU/GPU (GPU compare solo se torch.cuda.is_available() è True).
 
-Poi fa 2 fasi:
+Poi fa 2 fasi da solo in automatico :
 
 # 1) Setup (modello)
 
