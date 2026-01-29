@@ -1,5 +1,42 @@
 <img width="955" height="666" alt="image" src="https://github.com/user-attachments/assets/bf53b921-bf84-4069-8e36-aa0065bf70b4" />
 
+Scegli profilo: Scalping (1m/3m) o Swing (15m/1h).
+
+Premi AVVIA → popup CPU/GPU (GPU compare solo se torch.cuda.is_available() è True).
+
+Poi fa 2 fasi:
+
+1) Setup (modello)
+
+Se trova già i file model_*.pt, scaler_*.joblib, meta_*.joblib → li carica e parte.
+
+Se non li trova → scarica lo storico KuCoin, crea il dataset e fa train/val/test + walk-forward OOS.
+
+In questa fase fa tuning automatico (thr, horizon, epochs, confidenza).
+Massimo 30 minuti: se non raggiunge il 90% si ferma comunque e usa il best trovato.
+
+2) Realtime
+
+Ogni pochi secondi:
+
+prende le ultime candele (2 timeframe) + orderbook/funding/open interest (live)
+
+calcola le feature, le normalizza, passa al modello
+
+produce 3 probabilità: P(LONG), P(SHORT), P(NO TRADE)
+
+decide il segnale:
+
+NO TRADE se il modello lo prevede o se LONG/SHORT non supera la soglia di confidenza
+
+altrimenti LONG o SHORT
+
+se LONG/SHORT: calcola anche Take Profit (basato su ATR% + confidenza)
+
+aggiorna grafici + rete neurale 3D (LONG verde, SHORT rosso, NO TRADE blu)
+
+ARRESTA ferma il loop realtime in sicurezza.
+
 # 🚀 tradai.py
 
 ### ETH AI Trading Dashboard — KuCoin
